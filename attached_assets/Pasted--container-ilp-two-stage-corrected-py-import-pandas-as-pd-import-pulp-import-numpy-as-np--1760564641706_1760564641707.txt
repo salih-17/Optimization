@@ -1,0 +1,108 @@
+# container_ilp_two_stage_corrected.py
+import pandas as pd
+import pulp
+import numpy as np
+# ---------------- configirations ----------------
+CONTAINER_VOLUME_M3 = 33.0
+CONTAINER_MAX_WEIGHT_KG = 26000.0
+AVAILABLE_BUDGET = 20000    
+GLOBAL_LEAD_TIME_DAYS = 30  
+w_profit, w_density, w_velocity = 0.6, 0.4, 0.1
+df = pd.read_csv("products_with_cost.csv")
+
+for col in ["LeadTimeDays", "MinShipQty", "CoverageDays", "SalesPerDay", "AvailableStock"]:
+    if col not in df.columns:
+        if col == "LeadTimeDays":
+            df[col] = GLOBAL_LEAD_TIME_DAYS
+        else:
+            df[col] = 0
+# ---------------- some calulated columns ----------------
+df["DemandDuringLeadTime"] = df["SalesPerDay"] * df["LeadTimeDays"]
+df["DemandDuringCoverage"] = df["SalesPerDay"] * df["CoverageDays"]
+df["TotalNeeded"] = df["DemandDuringLeadTime"] + df["DemandDuringCoverage"]
+df["OrderQty"] = (df["TotalNeeded"] - df["AvailableStock"]).clip(lower=0).astype(int)
+df["MaxShippable"] = df["OrderQty"]
+df["VolumePerBox_m3"] = df["BoxLength_m"] * df["BoxWidth_m"] * df["BoxHeight_m"]
+df["VolumePerBox_m3"] = df["VolumePerBox_m3"].replace(0, 1e-9)
+df["ProfitPerBox"] = df["ProfitPerBox"]
+df["ProfitPerCubicMeter"] = df["ProfitPerBox"] / df["VolumePerBox_m3"]
+
+# ----------------  Score Calculation  ----------------
+def norm_minmax(s):
+    s = s.astype(float)
+    mn, mx = s.min(), s.max()
+    if np.isclose(mx, mn):
+        return np.ones(len(s)) * 0.5
+    return (s - mn) / (mx - mn)
+
+df["n_profit"] = norm_minmax(df["ProfitPerBox"])
+df["n_density"] = norm_minmax(df["ProfitPerCubicMeter"])
+df["n_velocity"] = norm_minmax(df["SalesPerDay"])
+df["score"] = w_profit * df["n_profit"] + w_density * df["n_density"] + w_velocity * df["n_velocity"]
+
+# ---------------- Model Building ----------------
+model1 = pulp.LpProblem("Stage1_Maximize_Profit", pulp.LpMaximize)
+
+# ---------------- Constraints ----------------
+
+x_vars = {}
+for _, row in df.iterrows():
+    up = int(row["MaxShippable"])
+    var = pulp.LpVariable(f"x_{row['SKU']}", lowBound=0, upBound=up, cat="Integer")
+    x_vars[row["SKU"]] = var
+    
+y_vars = {}
+for _, row in df.iterrows():
+    y = pulp.LpVariable(f"y_{row['SKU']}", cat="Binary")
+    y_vars[row["SKU"]] = y
+    # x >= MinShipQty * y
+    model1 += x_vars[row["SKU"]] >= int(row.get("MinShipQty", 0)) * y
+    # x <= M * y
+    model1 += x_vars[row["SKU"]] <= int(max(1, row["MaxShippable"])) * y
+
+model1 += pulp.lpSum([row["CostPerBox"] * x_vars[row["SKU"]] for _, row in df.iterrows()]) <= AVAILABLE_BUDGET
+model1 += pulp.lpSum( [row["VolumePerBox_m3"] * x_vars[row["SKU"]] for _ , row in df.iterrows()] ) <= CONTAINER_VOLUME_M3
+model1 += pulp.lpSum([row["WeightPerBox_kg"] * x_vars[row["SKU"]] for _, row in df.iterrows()]) <= CONTAINER_MAX_WEIGHT_KG
+
+# Target
+model1 += pulp.lpSum([row["score"] * x_vars[row["SKU"]] for _, row in df.iterrows()])
+
+model1 += pulp.lpSum([row["CostPerBox"] * x_vars[row["SKU"]] for _, row in df.iterrows()]) <= AVAILABLE_BUDGET
+model1 += pulp.lpSum( [row["VolumePerBox_m3"] * x_vars[row["SKU"]] for _ , row in df.iterrows()] ) <= CONTAINER_VOLUME_M3
+model1 += pulp.lpSum([row["WeightPerBox_kg"] * x_vars[row["SKU"]] for _, row in df.iterrows()]) <= CONTAINER_MAX_WEIGHT_KG
+
+# Target
+model1 += pulp.lpSum([row["score"] * x_vars[row["SKU"]] for _, row in df.iterrows()])
+# ---------- Results ----------
+selected = []
+total_volume = total_weight = total_adjprofit = total_score = total_cost = 0
+for _, row in df.iterrows():
+    sku = row["SKU"]
+    qty = int(pulp.value(x_vars[sku]) or 0)
+    if qty > 0:
+        vol = row["VolumePerBox_m3"] * qty
+        wt = row["WeightPerBox_kg"] * qty
+        adjprofit = row["ProfitPerBox"] * qty
+        score_val = row["score"] * qty
+        cost = row["CostPerBox"] * qty
+        selected.append({
+            "SKU": sku, "Quantity": qty, "Volume_m3": vol, "Weight_kg": wt,
+            "AdjProfit": adjprofit, "Score": score_val, "Cost": cost,
+            "OrderQty": int(row["OrderQty"])
+        })
+        total_volume += vol
+        total_weight += wt
+        total_adjprofit += adjprofit
+        total_score += score_val
+        total_cost += cost
+# ---------- Print summary ----------
+print("Status:", pulp.LpStatus[model1.status])
+print(f"Total boxes selected: {sum(it['Quantity'] for it in selected)}")
+print(f"Total volume used: {total_volume:.3f}/{CONTAINER_VOLUME_M3} m3 ({total_volume/CONTAINER_VOLUME_M3*100:.1f}%)")
+print(f"Total weight used: {total_weight:.1f}/{CONTAINER_MAX_WEIGHT_KG} kg ({total_weight/CONTAINER_MAX_WEIGHT_KG*100:.1f}%)")
+print(f"Total cost of selected boxes: {total_cost:.2f} (available budget: {AVAILABLE_BUDGET})")
+print(f"Total adjusted profit (sum ProfitPerBox): {total_adjprofit:.2f}")
+print(f"Total Score: {total_score:.3f}")
+print("\nSelected SKUs (qty, OrderQty):")
+for it in selected:
+    print(f"{it['SKU']}: qty={it['Quantity']}, orderNeeded={it['OrderQty']}, vol={it['Volume_m3']:.3f} m3, cost={it['Cost']:.2f}, score={it['Score']:.3f}")
